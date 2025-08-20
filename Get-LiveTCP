@@ -1,0 +1,139 @@
+function Get-LiveTCP {
+    # Creates persistent Array outside of while loop and appends it with cachced connection details.
+    param (
+        [string]$LogFile = "$env:TEMP\Connection_Monitor_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+    )
+
+    # Array of known malicious or suspicious ports (ssh, Telnet, RPC, NetBIOS, SMB, RDP, Alternate HTTP, Alternate HTTP, Metasploit, Mobile Malware, Backdoors)
+    $CriticalPorts = @(22, 23, 135, 139, 445, 3389, 8080, 8888, 4444, 5555, 1337)
+    $global:persistentConnections = @()
+
+    while ($true) {
+        Clear-Host
+        Write-Host "Connection Tracker launched by $(whoami) - $(Get-Date)" -ForegroundColor Cyan
+
+        # Get established TCP connections ignoring any loopback or local addresses.
+        $conns = Get-NetTCPConnection |
+            Where-Object { $_.State -eq 'Established' } |
+            Where-Object { $_.LocalAddress -notin @("0.0.0.0", "127.0.0.1", "::", "::1") } |
+            Where-Object { $_.RemoteAddress -ne '0.0.0.0' }
+
+	# --- Active TCP Connections ---
+        # Display active TCP connections, ignoring any activity pointed towards loopback or local IPs. highlight suspicious connections based on their known associations.
+        function Get-ActiveTCP {
+            Write-Host "`nActive TCP Connections" -ForegroundColor Green
+            Write-Host "---------------------------------------------------"
+
+            $highlightedPIDs = @()
+            $procCache = @{}
+
+            foreach ($conn in $conns) {
+                if (-not $procCache.ContainsKey($conn.OwningProcess)) {
+                    $procCache[$conn.OwningProcess] = Get-CimInstance Win32_Process -Filter "ProcessId = $($conn.OwningProcess)" -ErrorAction SilentlyContinue
+                }
+                $process = $procCache[$conn.OwningProcess]
+                $procName = if ($process) { $process.Name } else { "Unknown" }
+                $procCmd = if ($process) { $process.CommandLine } else { "" }
+
+                $line = "{0,-15} {1,-5} => {2,-15} {3,-5}  [{4}] {5}" -f `
+                    $conn.LocalAddress, $conn.LocalPort, `
+                    $conn.RemoteAddress, $conn.RemotePort, `
+                    $conn.State, $procName
+
+                # Determine which color should be 
+                $color = if ($CriticalPorts -contains $conn.RemotePort) { "Red" } elseif ($conn.RemotePort -ne 443 -and $conn.RemotePort -ne 0) { "Yellow" } else { "Cyan" }
+                Write-Host $line -ForegroundColor $color
+
+                if ($conn.RemotePort -ne 443 -and $conn.RemotePort -ne 0) {
+                    if ($highlightedPIDs -notcontains $conn.OwningProcess) {
+                        $highlightedPIDs += $conn.OwningProcess
+                    }
+
+                    $connKey = "$($conn.RemoteAddress):$($conn.RemotePort)"
+                    if (-not ($global:persistentConnections.RemoteKey -contains $connKey)) {
+                        $entry = [PSCustomObject]@{
+                            RemoteKey     = $connKey
+                            RemoteIP      = $conn.RemoteAddress
+                            RemotePort    = $conn.RemotePort
+                            ProcessName   = $procName
+                            CommandLine   = $procCmd
+                            FirstSeen     = (Get-Date)
+                            HighlightColor = $color
+                        }
+                        $global:persistentConnections += $entry
+                        $entry | Export-Csv -Path $LogFile -Append -NoTypeInformation
+                    }
+                }
+            }
+
+            return $highlightedPIDs, $procCache
+        }
+        $results = Get-ActiveTCP
+        $highlightedPIDs = $results[0]
+        $procCache = $results[1]
+
+        # --- Processes for Non-Standard Connections ---
+	# Displays current process CIM information for non-standard or suspicious processes
+        function Get-HighlightedTCP {
+            Write-Host "---------------------------------------------------"
+            Write-Host "`nProcesses for Non-Standard Connections" -ForegroundColor Green
+            Write-Host "---------------------------------------------------"
+
+            foreach ($pidVal in $highlightedPIDs) {
+                $process = $procCache[$pidVal]
+                if ($process) {
+                    Write-Host "Process Name: $($process.Name)"
+                    Write-Host "    Process ID: $pidVal  Parent Process ID: $($process.ParentProcessId)"
+                    if ($parent = $procCache[$process.ParentProcessId]) {
+                        Write-Host "    Parent Process: $($parent.Name)"
+                    }
+
+                    if ($process.CommandLine) {
+                        $maxLength = 500
+                        $cmdLine = if ($process.CommandLine.Length -gt $maxLength) {
+                            $process.CommandLine.Substring(0, $maxLength) + "..."
+                        } else {
+                            $process.CommandLine
+                        }
+
+                        if ($cmdLine -match "-enc|-EncodedCommand|-nop|-w hidden") {
+                            Write-Host "    Command Line: $cmdLine" -ForegroundColor Red
+                        } else {
+                            Write-Host "    Command Line: $cmdLine" -ForegroundColor Yellow
+                        }
+                    }
+                    Write-Host "---------------------------------------------------"
+                }
+            }
+        }
+        Get-HighlightedTCP
+
+        # --- Observed Connections ---
+	# Maintains persistent list of observed connections over non-standard or suspicious ports.
+        function Get-ObservedTCP {
+            Write-Host "`nObserved Connections`n" -ForegroundColor Green
+            
+
+            # Header row
+            Write-Host ("{0,-20} {1,-6} {2,-15} {3,-20} {4}" -f "RemoteIP", "Port", "ProcessName", "FirstSeen", "CommandLine") -ForegroundColor Green
+            Write-Host "---------------------------------------------------"
+            foreach ($entry in $global:persistentConnections) {
+                # Truncate command line for display
+                $maxLength = 78
+                $truncatedCmd = if ($entry.CommandLine.Length -gt $maxLength) {
+                    $entry.CommandLine.Substring(0, $maxLength) + "..."
+                } else {
+                    $entry.CommandLine
+                }
+
+                Write-Host ("{0,-20} {1,-6} {2,-15} {3,-20} {4}" -f `
+                    $entry.RemoteIP, $entry.RemotePort, $entry.ProcessName, $entry.FirstSeen, $truncatedCmd) `
+                    -ForegroundColor $entry.HighlightColor
+            }
+        }
+
+        Get-ObservedTCP
+
+        Start-Sleep -Seconds 3
+    }
+}
