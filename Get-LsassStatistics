@@ -1,0 +1,29 @@
+function Get-LsassStatistics {
+
+    $lsass = Get-Process -Name lsass -ErrorAction SilentlyContinue
+
+    if ($lsass) {
+        Write-Host "=== LSASS (PID: $($lsass.Id)) ===" -ForegroundColor Cyan
+        Write-Host "Threads: $($lsass.Threads.Count) | Handles: $($lsass.Handles)"
+        Write-Host ""
+
+        # Show module signature validation
+        Write-Host ">>> Loaded Modules:" -ForegroundColor Green
+        $lsass.Modules | ForEach-Object {
+            $sig = Get-AuthenticodeSignature $_.FileName
+            [PSCustomObject]@{
+                Module          = $_.ModuleName
+                Path            = $_.FileName
+                SignatureStatus = $sig.Status
+                Signer          = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "None" }
+            }
+        } | Format-Table -AutoSize
+
+        Write-Host ""
+        # Show threads (basic info)
+        Write-Host ">>> Threads:" -ForegroundColor Green
+        $lsass.Threads | Select-Object Id, State, WaitReason, StartAddress | Format-Table -AutoSize
+    } else {
+        Write-Host "LSASS not found!" -ForegroundColor Red
+    }
+}
